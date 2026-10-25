@@ -1,0 +1,391 @@
+package db
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+const (
+	dbPath   = "/opt/osbo/datausd"
+	moneda   = "USDT"
+	exchange = "binancep2p"
+	timeFmt  = "2006-01-02 15:04:05"
+
+	// TimeFmt es el formato de almacenamiento en DB (exportado para uso en otros paquetes)
+	TimeFmt = timeFmt
+	// DisplayTimeFmt es el formato legible para mostrar fecha y hora con segundos.
+	DisplayTimeFmt = "02/01/2006 · 15:04:05"
+	// DisplayDateFmt es el formato legible para mostrar solo la fecha.
+	DisplayDateFmt = "02/01/2006"
+)
+
+// Cotizacion represents a row in the cotizaciones table
+type Cotizacion struct {
+	Moneda     string  `json:"moneda"`
+	Cotizacion float64 `json:"cotizacion"`
+	Purchase   float64 `json:"purchase"`
+	Datetime   string  `json:"datetime"`
+	Exchange   string  `json:"exchange"`
+	MonedaDest string  `json:"moneda_dest,omitempty"` // para futuras conversiones
+}
+
+// Config represents a row in the config table
+type Config struct {
+	CurrentDate       string
+	ChatID            string
+	MessageID         sql.NullString
+	MessageIDUSD      sql.NullString
+	Umbral            sql.NullFloat64 // referencia USDT
+	UmbralReferencial sql.NullFloat64 // referencia USD Referencial
+}
+
+// DB wraps the sql.DB connection
+type DB struct {
+	conn *sql.DB
+}
+
+// New opens the SQLite database connection and applies performance pragmas
+func New() (*DB, error) {
+	conn, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("error opening database: %w", err)
+	}
+
+	if err := conn.Ping(); err != nil {
+		return nil, fmt.Errorf("error connecting to database: %w", err)
+	}
+
+	// Enable WAL mode for better concurrent read/write performance
+	if _, err := conn.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return nil, fmt.Errorf("error setting WAL mode: %w", err)
+	}
+
+	// Ensure 'purchase' column exists (migration)
+	_, _ = conn.Exec("ALTER TABLE cotizaciones ADD COLUMN purchase REAL DEFAULT 0")
+	// Ensure 'umbral_referencial' column exists (migration)
+	_, _ = conn.Exec("ALTER TABLE config ADD COLUMN umbral_referencial REAL")
+	// Ensure 'messageidusd' column exists (migration)
+	_, _ = conn.Exec("ALTER TABLE config ADD COLUMN messageidusd TEXT")
+
+	return &DB{conn: conn}, nil
+}
+
+// Close closes the database connection
+func (d *DB) Close() error {
+	return d.conn.Close()
+}
+
+// InsertCotizacion inserts a new cotizacion record.
+// Uses current local time to avoid duplicate key errors when the API
+// returns the same cached timestamp across consecutive calls.
+func (d *DB) InsertCotizacion(bid, purchase float64) error {
+	datetime := time.Now().Format(timeFmt)
+
+	_, err := d.conn.Exec(
+		"INSERT INTO cotizaciones (moneda, cotizacion, purchase, datetime, exchange) VALUES (?, ?, ?, ?, ?)",
+		moneda, bid, purchase, datetime, exchange,
+	)
+	if err != nil {
+		return fmt.Errorf("error inserting cotizacion: %w", err)
+	}
+
+	return nil
+}
+
+// GetAllCotizaciones retrieves all records from the cotizaciones table
+func (d *DB) GetAllCotizaciones() ([]Cotizacion, error) {
+	rows, err := d.conn.Query(
+		"SELECT moneda, cotizacion, purchase, datetime, exchange, moneda_dest FROM cotizaciones ORDER BY datetime ASC",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error querying cotizaciones: %w", err)
+	}
+	defer rows.Close()
+
+	var cotizaciones []Cotizacion
+	for rows.Next() {
+		var c Cotizacion
+		if err := rows.Scan(&c.Moneda, &c.Cotizacion, &c.Purchase, &c.Datetime, &c.Exchange, &c.MonedaDest); err != nil {
+			return nil, fmt.Errorf("error scanning row: %w", err)
+		}
+		cotizaciones = append(cotizaciones, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	return cotizaciones, nil
+}
+
+// ExportCotizacionesToJSON exports all cotizaciones to a JSON file
+func (d *DB) ExportCotizacionesToJSON(outputPath string) error {
+	cotizaciones, err := d.GetAllCotizaciones()
+	if err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(cotizaciones, "", "  ")
+	if err != nil {
+		return fmt.Errorf("error marshaling JSON: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return fmt.Errorf("error creating output directory: %w", err)
+	}
+
+	if err := os.WriteFile(outputPath, data, 0644); err != nil {
+		return fmt.Errorf("error writing JSON file: %w", err)
+	}
+
+	return nil
+}
+
+// GetConfig retrieves the single config record
+func (d *DB) GetConfig() (*Config, error) {
+	var cfg Config
+	err := d.conn.QueryRow("SELECT currentdate, chatid, messageid, messageidusd, umbral, umbral_referencial FROM config ORDER BY rowid LIMIT 1").
+		Scan(&cfg.CurrentDate, &cfg.ChatID, &cfg.MessageID, &cfg.MessageIDUSD, &cfg.Umbral, &cfg.UmbralReferencial)
+	if err != nil {
+		return nil, fmt.Errorf("error reading config: %w", err)
+	}
+	return &cfg, nil
+}
+
+// UpdateConfig updates currentdate, messageid, umbral (USDT) y umbral_referencial (USD Ref)
+func (d *DB) UpdateConfig(currentDate, messageID string, umbralUSDT, umbralRef float64) error {
+	var mID any = messageID
+	if messageID == "" {
+		mID = nil
+	}
+	res, err := d.conn.Exec(
+		"UPDATE config SET currentdate = ?, messageid = ?, umbral = ?, umbral_referencial = ? WHERE rowid = (SELECT rowid FROM config ORDER BY rowid LIMIT 1)",
+		currentDate, mID, umbralUSDT, umbralRef,
+	)
+	if err != nil {
+		return fmt.Errorf("error updating config: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("config: ninguna fila actualizada (tabla vacía?)")
+	}
+	return nil
+}
+
+// UpdateConfigMessageID updates only the currentdate and messageid while preserving metrics thresholds.
+func (d *DB) UpdateConfigMessageID(currentDate, messageID string) error {
+	var mID any = messageID
+	if messageID == "" {
+		mID = nil
+	}
+	res, err := d.conn.Exec(
+		"UPDATE config SET currentdate = ?, messageid = ? WHERE rowid = (SELECT rowid FROM config ORDER BY rowid LIMIT 1)",
+		currentDate, mID,
+	)
+	if err != nil {
+		return fmt.Errorf("error updating config messageID: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("config: ninguna fila actualizada (tabla vacía?)")
+	}
+	return nil
+}
+
+// UpdateConfigUSD updates currentdate, messageidusd, umbral (USDT) y umbral_referencial (USD Ref)
+func (d *DB) UpdateConfigUSD(currentDate, messageIDUSD string, umbralUSDT, umbralRef float64) error {
+	var mID any = messageIDUSD
+	if messageIDUSD == "" {
+		mID = nil
+	}
+	res, err := d.conn.Exec(
+		"UPDATE config SET currentdate = ?, messageidusd = ?, umbral = ?, umbral_referencial = ? WHERE rowid = (SELECT rowid FROM config ORDER BY rowid LIMIT 1)",
+		currentDate, mID, umbralUSDT, umbralRef,
+	)
+	if err != nil {
+		return fmt.Errorf("error updating config USD: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("config: ninguna fila actualizada (tabla vacía?)")
+	}
+	return nil
+}
+
+// UpdateConfigMessageIDUSD updates only the currentdate and messageidusd while preserving metrics thresholds.
+func (d *DB) UpdateConfigMessageIDUSD(currentDate, messageIDUSD string) error {
+	var mID any = messageIDUSD
+	if messageIDUSD == "" {
+		mID = nil
+	}
+	res, err := d.conn.Exec(
+		"UPDATE config SET currentdate = ?, messageidusd = ? WHERE rowid = (SELECT rowid FROM config ORDER BY rowid LIMIT 1)",
+		currentDate, mID,
+	)
+	if err != nil {
+		return fmt.Errorf("error updating config messageIDUSD: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("config: ninguna fila actualizada (tabla vacía?)")
+	}
+	return nil
+}
+
+// DeleteOlderThan deletes cotizaciones older than the given duration and returns the count deleted.
+func (d *DB) DeleteOlderThan(d1 time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-d1).Format(timeFmt)
+	result, err := d.conn.Exec("DELETE FROM cotizaciones WHERE datetime < ?", cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("error deleting old cotizaciones: %w", err)
+	}
+	return result.RowsAffected()
+}
+
+// GetLatestByMoneda returns the most recent cotizacion for a specific moneda
+func (d *DB) GetLatestByMoneda(name string) (Cotizacion, error) {
+	var c Cotizacion
+	var md sql.NullString
+	err := d.conn.QueryRow(
+		"SELECT moneda, cotizacion, purchase, datetime, exchange, moneda_dest FROM cotizaciones WHERE moneda = ? ORDER BY datetime DESC LIMIT 1",
+		name,
+	).Scan(&c.Moneda, &c.Cotizacion, &c.Purchase, &c.Datetime, &c.Exchange, &md)
+
+	if err != nil {
+		return Cotizacion{}, err
+	}
+	c.MonedaDest = md.String
+	return c, nil
+}
+
+// GetLatestSummary returns a map of the latest quotes for the three main types
+func (d *DB) GetLatestSummary() (map[string]Cotizacion, error) {
+	summary := make(map[string]Cotizacion)
+
+	monedas := []string{"USDT", "usd oficial", "usd referencial", "eur", "oro", "plata", "ufv"}
+	for _, m := range monedas {
+		c, err := d.GetLatestByMoneda(m)
+		if err == nil {
+			summary[m] = c
+		} else if err != sql.ErrNoRows {
+			return nil, fmt.Errorf("error fetching %s: %w", m, err)
+		}
+	}
+
+	return summary, nil
+}
+
+// Baseline holds a previous-period reference value with presence semantics,
+// since the previous day may have no recorded quotes for a given moneda.
+type Baseline struct {
+	Value  float64
+	Exists bool
+}
+
+// USDBaselines holds previous-calendar-day reference values used to render
+// trend indicators for the USD Telegram image.
+type USDBaselines struct {
+	USDT           Baseline // average cotizacion for USDT during the previous calendar day
+	UsdOficial     Baseline // last cotizacion for "usd oficial" during the previous calendar day
+	UsdReferencial Baseline // last cotizacion for "usd referencial" during the previous calendar day
+	Eur            Baseline // last cotizacion for "eur" during the previous calendar day
+	Oro            Baseline // last cotizacion for "oro" during the previous calendar day
+	Plata          Baseline // last cotizacion for "plata" during the previous calendar day
+	Ufv            Baseline // last cotizacion for "ufv" during the previous calendar day
+}
+
+// previousDayRange returns the [start, end) bounds of the previous local
+// calendar day, formatted as TimeFmt for direct use in SQL comparisons.
+func previousDayRange() (start, end string) {
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	yesterdayStart := todayStart.AddDate(0, 0, -1)
+	return yesterdayStart.Format(timeFmt), todayStart.Format(timeFmt)
+}
+
+// GetPreviousDayLastByMoneda returns the last recorded cotizacion for the
+// given moneda during the previous calendar day, if any.
+// Handles both full datetime ("2006-01-02 15:04:05") and date-only ("2006-01-02") formats.
+func (d *DB) GetPreviousDayLastByMoneda(name string) (Baseline, error) {
+	yesterdayDate := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	var value float64
+	err := d.conn.QueryRow(
+		"SELECT cotizacion FROM cotizaciones WHERE moneda = ? AND substr(datetime, 1, 10) = ? ORDER BY datetime DESC LIMIT 1",
+		name, yesterdayDate,
+	).Scan(&value)
+	if err == sql.ErrNoRows {
+		return Baseline{}, nil
+	}
+	if err != nil {
+		return Baseline{}, fmt.Errorf("error fetching previous day last for %s: %w", name, err)
+	}
+	return Baseline{Value: value, Exists: true}, nil
+}
+
+// GetPreviousDayAverageByMoneda returns the average recorded cotizacion for
+// the given moneda during the previous calendar day, if any records exist.
+// Handles both full datetime ("2006-01-02 15:04:05") and date-only ("2006-01-02") formats.
+func (d *DB) GetPreviousDayAverageByMoneda(name string) (Baseline, error) {
+	yesterdayDate := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	var avg sql.NullFloat64
+	var count int
+	err := d.conn.QueryRow(
+		"SELECT AVG(cotizacion), COUNT(*) FROM cotizaciones WHERE moneda = ? AND substr(datetime, 1, 10) = ?",
+		name, yesterdayDate,
+	).Scan(&avg, &count)
+	if err != nil {
+		return Baseline{}, fmt.Errorf("error fetching previous day average for %s: %w", name, err)
+	}
+	if count == 0 || !avg.Valid {
+		return Baseline{}, nil
+	}
+	return Baseline{Value: avg.Float64, Exists: true}, nil
+}
+
+// GetUSDBaselines returns the previous-calendar-day baselines used for the
+// USD image trend indicators: the average for USDT and the last quote for
+// USD Oficial.
+func (d *DB) GetUSDBaselines() (USDBaselines, error) {
+	usdt, err := d.GetPreviousDayAverageByMoneda("USDT")
+	if err != nil {
+		return USDBaselines{}, err
+	}
+	oficial, err := d.GetPreviousDayLastByMoneda("usd oficial")
+	if err != nil {
+		return USDBaselines{}, err
+	}
+	referencial, err := d.GetPreviousDayLastByMoneda("usd referencial")
+	if err != nil {
+		return USDBaselines{}, err
+	}
+	eur, err := d.GetPreviousDayLastByMoneda("eur")
+	if err != nil {
+		return USDBaselines{}, err
+	}
+	oro, err := d.GetPreviousDayLastByMoneda("oro")
+	if err != nil {
+		return USDBaselines{}, err
+	}
+	plata, err := d.GetPreviousDayLastByMoneda("plata")
+	if err != nil {
+		return USDBaselines{}, err
+	}
+	ufv, err := d.GetPreviousDayLastByMoneda("ufv")
+	if err != nil {
+		return USDBaselines{}, err
+	}
+	return USDBaselines{
+		USDT:           usdt,
+		UsdOficial:     oficial,
+		UsdReferencial: referencial,
+		Eur:            eur,
+		Oro:            oro,
+		Plata:          plata,
+		Ufv:            ufv,
+	}, nil
+}
