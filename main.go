@@ -280,7 +280,16 @@ func main() {
 					ui.Warn(fmt.Sprintf("Error enviando spike USD: %v", errUSD))
 				} else {
 					ui.Success(fmt.Sprintf("Spike USD enviado → nuevo msgID=%d", newUSDID))
+					saveMessageIDUSD(strconv.Itoa(newUSDID))
+				}
+
+				// Advance the thresholds only after both messages were delivered.
+				// If one send fails, the old threshold remains active so the next
+				// cron run retries the alert instead of losing the spike.
+				if errResto == nil && errUSD == nil {
 					saveConfigUSD(strconv.Itoa(newUSDID))
+				} else {
+					ui.Warn("Alerta USD incompleta: se conservaron los umbrales anteriores para reintentar el par en la próxima ejecución.")
 				}
 
 			default:
